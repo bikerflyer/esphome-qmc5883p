@@ -1,0 +1,104 @@
+# --- Web UI for visibility + OTA during calibration ---
+web_server:
+  port: 80
+  ota: true
+  auth:
+    username: admin
+    password: change-me
+
+# --- Replace your QMC5883P block with this (slower poll, fixed mapping) ---
+sensor:
+  - platform: qmc5883p
+    i2c_id: bus_a
+    address: 0x2C
+    id: magnetometer
+    update_interval: 1500ms
+    rotation: 270
+    axes_map: [y, -x, z]
+
+    field_strength_x:
+      id: mag_x
+      name: "Mag X (µT)"
+      internal: true
+    field_strength_y:
+      id: mag_y
+      name: "Mag Y (µT)"
+      internal: true
+    field_strength_z:
+      id: mag_z
+      name: "Mag Z (µT)"
+      internal: true
+
+# --- Globals for 30s hard-iron offset capture ---
+globals:
+  - id: g_x_min     ; type: float ; initial_value: '1000000'
+  - id: g_x_max     ; type: float ; initial_value: '-1000000'
+  - id: g_y_min     ; type: float ; initial_value: '1000000'
+  - id: g_y_max     ; type: float ; initial_value: '-1000000'
+  - id: g_x_off     ; type: float ; initial_value: '0.0'
+  - id: g_y_off     ; type: float ; initial_value: '0.0'
+
+# --- Offsets as readable sensors (so you can note them, then revert firmware) ---
+sensor:
+  - platform: template
+    name: "Mag X Offset (µT)"
+    id: mag_x_offset
+    update_interval: 1s
+    accuracy_decimals: 2
+    lambda: |-
+      return id(g_x_off);
+  - platform: template
+    name: "Mag Y Offset (µT)"
+    id: mag_y_offset
+    update_interval: 1s
+    accuracy_decimals: 2
+    lambda: |-
+      return id(g_y_off)
+
+text_sensor:
+  - platform: template
+    name: "Mag Cal Status"
+    id: mag_cal_status
+
+button:
+  - platform: template
+    name: "Start Mag Cal (30s)"
+    on_press:
+      - script.execute: mag_cal_30s
+
+script:
+  - id: mag_cal_30s
+    mode: queued
+    then:
+      - text_sensor.template.publish:
+          id: mag_cal_status
+          state: "CALIBRATING: rotate 360° slowly for 30s"
+      - lambda: |-
+          id(g_x_min) =  1e6;  id(g_x_max) = -1e6;
+          id(g_y_min) =  1e6;  id(g_y_max) = -1e6;
+      - repeat:
+          count: 300         # 300 x 100ms = ~30s
+          then:
+            - lambda: |-
+                float mx = id(mag_x).state;
+                float my = id(mag_y).state;
+                if (!isnan(mx) && !isnan(my)) {
+                  if (mx < id(g_x_min)) id(g_x_min) = mx;
+                  if (mx > id(g_x_max)) id(g_x_max) = mx;
+                  if (my < id(g_y_min)) id(g_y_min) = my;
+                  if (my > id(g_y_max)) id(g_y_max) = my;
+                }
+            - delay: 100ms
+      - lambda: |-
+          id(g_x_off) = - (id(g_x_max) + id(g_x_min)) / 2.0f;
+          id(g_y_off) = - (id(g_y_max) + id(g_y_min)) / 2.0f;
+          ESP_LOGI("MAGCAL", "X[min=%.2f max=%.2f]  Y[min=%.2f max=%.2f]",
+                   id(g_x_min), id(g_x_max), id(g_y_min), id(g_y_max));
+          ESP_LOGI("MAGCAL", "Computed offsets: Xoff=%.2f  Yoff=%.2f", id(g_x_off), id(g_y_off));
+          ESP_LOGI("MAGCAL", "Paste into QMC5883P:  offsets: [%.2f, %.2f, 0]", id(g_x_off), id(g_y_off));
+      - text_sensor.template.publish:
+          id: mag_cal_status
+          state: !lambda |-
+            char buf[96];
+            snprintf(buf, sizeof(buf), "DONE: offsets [%.2f, %.2f, 0]", id(g_x_off), id(g_y_off));
+            return std::string(buf);
